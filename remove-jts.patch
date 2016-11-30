@@ -1,0 +1,1326 @@
+diff --git a/version-1.3.176/h2/src/main/META-INF/MANIFEST.MF b/version-1.3.176/h2/src/main/META-INF/MANIFEST.MF
+index 042fd6e..58d4cb3 100644
+--- a/version-1.3.176/h2/src/main/META-INF/MANIFEST.MF
++++ b/version-1.3.176/h2/src/main/META-INF/MANIFEST.MF
+@@ -31,8 +31,6 @@ Import-Package: javax.management,
+  org.apache.lucene.search;version="[3.0.0,3.1.0)";resolution:=optional,
+  org.apache.lucene.store;version="[3.0.0,3.1.0)";resolution:=optional,
+  org.apache.lucene.util;version="[3.0.0,3.1.0)";resolution:=optional,
+- com.vividsolutions.jts.geom;version="1.13";resolution:=optional,
+- com.vividsolutions.jts.io;version="1.13";resolution:=optional,
+  org.h2;version="[${version},1.4.0)",
+  org.h2.api;version="[${version},1.4.0)",
+  org.h2.fulltext;version="[${version},1.4.0)",
+diff --git a/version-1.3.176/h2/src/main/org/h2/expression/Comparison.java b/version-1.3.176/h2/src/main/org/h2/expression/Comparison.java
+index d0d7b94..712dd67 100644
+--- a/version-1.3.176/h2/src/main/org/h2/expression/Comparison.java
++++ b/version-1.3.176/h2/src/main/org/h2/expression/Comparison.java
+@@ -17,7 +17,6 @@ import org.h2.table.TableFilter;
+ import org.h2.util.New;
+ import org.h2.value.Value;
+ import org.h2.value.ValueBoolean;
+-import org.h2.value.ValueGeometry;
+ import org.h2.value.ValueNull;
+ 
+ /**
+@@ -293,12 +292,6 @@ public class Comparison extends Condition {
+         case SMALLER:
+             result = database.compare(l, r) < 0;
+             break;
+-        case SPATIAL_INTERSECTS: {
+-            ValueGeometry lg = (ValueGeometry) l.convertTo(Value.GEOMETRY);
+-            ValueGeometry rg = (ValueGeometry) r.convertTo(Value.GEOMETRY);
+-            result = lg.intersectsBoundingBox(rg);
+-            break;
+-        }
+         default:
+             throw DbException.throwInternalError("type=" + compareType);
+         }
+diff --git a/version-1.3.176/h2/src/main/org/h2/index/IndexCursor.java b/version-1.3.176/h2/src/main/org/h2/index/IndexCursor.java
+index 74af5a2..7f271ec 100644
+--- a/version-1.3.176/h2/src/main/org/h2/index/IndexCursor.java
++++ b/version-1.3.176/h2/src/main/org/h2/index/IndexCursor.java
+@@ -20,7 +20,6 @@ import org.h2.table.IndexColumn;
+ import org.h2.table.Table;
+ import org.h2.table.TableFilter;
+ import org.h2.value.Value;
+-import org.h2.value.ValueGeometry;
+ import org.h2.value.ValueNull;
+ 
+ /**
+@@ -182,14 +181,6 @@ public class IndexCursor implements Cursor {
+     private SearchRow getSpatialSearchRow(SearchRow row, int columnId, Value v) {
+         if (row == null) {
+             row = table.getTemplateRow();
+-        } else if (row.getValue(columnId) != null) {
+-            // if an object needs to overlap with both a and b,
+-            // then it needs to overlap with the the union of a and b
+-            // (not the intersection)
+-            ValueGeometry vg = (ValueGeometry) row.getValue(columnId).
+-                    convertTo(Value.GEOMETRY);
+-            v = ((ValueGeometry) v.convertTo(Value.GEOMETRY)).
+-                    getEnvelopeUnion(vg);
+         }
+         if (columnId < 0) {
+             row.setKey(v.getLong());
+diff --git a/version-1.3.176/h2/src/main/org/h2/index/SpatialTreeIndex.java b/version-1.3.176/h2/src/main/org/h2/index/SpatialTreeIndex.java
+deleted file mode 100644
+index a5e5280..0000000
+--- a/version-1.3.176/h2/src/main/org/h2/index/SpatialTreeIndex.java
++++ /dev/null
+@@ -1,299 +0,0 @@
+-/*
+- * Copyright 2004-2013 H2 Group. Multiple-Licensed under the H2 License,
+- * Version 1.0, and under the Eclipse Public License, Version 1.0
+- * (http://h2database.com/html/license.html).
+- * Initial Developer: H2 Group
+- */
+-package org.h2.index;
+-
+-import java.util.Iterator;
+-
+-import org.h2.engine.Constants;
+-import org.h2.engine.Session;
+-import org.h2.message.DbException;
+-import org.h2.mvstore.MVStore;
+-import org.h2.mvstore.db.MVTableEngine;
+-import org.h2.mvstore.rtree.MVRTreeMap;
+-import org.h2.mvstore.rtree.SpatialKey;
+-import org.h2.result.Row;
+-import org.h2.result.SearchRow;
+-import org.h2.result.SortOrder;
+-import org.h2.table.Column;
+-import org.h2.table.IndexColumn;
+-import org.h2.table.Table;
+-import org.h2.table.TableFilter;
+-import org.h2.value.Value;
+-import org.h2.value.ValueGeometry;
+-
+-import com.vividsolutions.jts.geom.Envelope;
+-import com.vividsolutions.jts.geom.Geometry;
+-
+-/**
+- * This is an index based on a MVR-TreeMap.
+- *
+- * @author Thomas Mueller
+- * @author Noel Grandin
+- * @author Nicolas Fortin, Atelier SIG, IRSTV FR CNRS 24888
+- */
+-public class SpatialTreeIndex extends BaseIndex implements SpatialIndex {
+-
+-    private static final String MAP_PREFIX  = "RTREE_";
+-
+-    private final MVRTreeMap<Long> treeMap;
+-    private final MVStore store;
+-
+-    private boolean closed;
+-    private boolean needRebuild;
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param table the table instance
+-     * @param id the index id
+-     * @param indexName the index name
+-     * @param columns the indexed columns (only one geometry column allowed)
+-     * @param persistent whether the index should be persisted
+-     * @param indexType the index type (only spatial index)
+-     * @param create whether to create a new index
+-     * @param session the session.
+-     */
+-    public SpatialTreeIndex(Table table, int id, String indexName,
+-            IndexColumn[] columns, IndexType indexType, boolean persistent,
+-            boolean create, Session session) {
+-        if (indexType.isUnique()) {
+-            throw DbException.getUnsupportedException("not unique");
+-        }
+-        if (!persistent && !create) {
+-            throw DbException.getUnsupportedException(
+-                    "Non persistent index called with create==false");
+-        }
+-        if (columns.length > 1) {
+-            throw DbException.getUnsupportedException(
+-                    "can only do one column");
+-        }
+-        if ((columns[0].sortType & SortOrder.DESCENDING) != 0) {
+-            throw DbException.getUnsupportedException(
+-                    "cannot do descending");
+-        }
+-        if ((columns[0].sortType & SortOrder.NULLS_FIRST) != 0) {
+-            throw DbException.getUnsupportedException(
+-                    "cannot do nulls first");
+-        }
+-        if ((columns[0].sortType & SortOrder.NULLS_LAST) != 0) {
+-            throw DbException.getUnsupportedException(
+-                    "cannot do nulls last");
+-        }
+-        initBaseIndex(table, id, indexName, columns, indexType);
+-        this.needRebuild = create;
+-        this.table = table;
+-        if (!database.isStarting()) {
+-            if (columns[0].column.getType() != Value.GEOMETRY) {
+-                throw DbException.getUnsupportedException(
+-                        "spatial index on non-geometry column, " +
+-                        columns[0].column.getCreateSQL());
+-            }
+-        }
+-        if (!persistent) {
+-            // Index in memory
+-            store = MVStore.open(null);
+-            treeMap =  store.openMap("spatialIndex",
+-                    new MVRTreeMap.Builder<Long>());
+-        } else {
+-            if (id < 0) {
+-                throw DbException.getUnsupportedException(
+-                        "Persistent index with id<0");
+-            }
+-            MVTableEngine.init(session.getDatabase());
+-            store = session.getDatabase().getMvStore().getStore();
+-            // Called after CREATE SPATIAL INDEX or
+-            // by PageStore.addMeta
+-            treeMap =  store.openMap(MAP_PREFIX + getId(),
+-                    new MVRTreeMap.Builder<Long>());
+-            if (treeMap.isEmpty()) {
+-                needRebuild = true;
+-            }
+-        }
+-    }
+-
+-    @Override
+-    public void close(Session session) {
+-        store.close();
+-        closed = true;
+-    }
+-
+-    @Override
+-    public void add(Session session, Row row) {
+-        if (closed) {
+-            throw DbException.throwInternalError();
+-        }
+-        treeMap.add(getEnvelope(row), row.getKey());
+-    }
+-
+-    private SpatialKey getEnvelope(SearchRow row) {
+-        Value v = row.getValue(columnIds[0]);
+-        Geometry g = ((ValueGeometry) v.convertTo(Value.GEOMETRY)).getGeometryNoCopy();
+-        Envelope env = g.getEnvelopeInternal();
+-        return new SpatialKey(row.getKey(),
+-                (float) env.getMinX(), (float) env.getMaxX(),
+-                (float) env.getMinY(), (float) env.getMaxY());
+-    }
+-
+-    @Override
+-    public void remove(Session session, Row row) {
+-        if (closed) {
+-            throw DbException.throwInternalError();
+-        }
+-        if (!treeMap.remove(getEnvelope(row), row.getKey())) {
+-            throw DbException.throwInternalError("row not found");
+-        }
+-    }
+-
+-    @Override
+-    public Cursor find(TableFilter filter, SearchRow first, SearchRow last) {
+-        return find(filter.getSession());
+-    }
+-
+-    @Override
+-    public Cursor find(Session session, SearchRow first, SearchRow last) {
+-        return find(session);
+-    }
+-
+-    private Cursor find(Session session) {
+-        return new SpatialCursor(treeMap.keySet().iterator(), table, session);
+-    }
+-
+-    @Override
+-    public Cursor findByGeometry(TableFilter filter, SearchRow intersection) {
+-        if (intersection == null) {
+-            return find(filter.getSession());
+-        }
+-        return new SpatialCursor(
+-                treeMap.findIntersectingKeys(getEnvelope(intersection)), table,
+-                filter.getSession());
+-    }
+-
+-    @Override
+-    protected long getCostRangeIndex(int[] masks, long rowCount,
+-            TableFilter filter, SortOrder sortOrder) {
+-        rowCount += Constants.COST_ROW_OFFSET;
+-        long cost = rowCount;
+-        long rows = rowCount;
+-        if (masks == null) {
+-            return cost;
+-        }
+-        for (Column column : columns) {
+-            int index = column.getColumnId();
+-            int mask = masks[index];
+-            if ((mask & IndexCondition.SPATIAL_INTERSECTS) != 0) {
+-                cost = 3 + rows / 4;
+-            }
+-        }
+-        return cost;
+-    }
+-
+-    @Override
+-    public double getCost(Session session, int[] masks, TableFilter filter,
+-            SortOrder sortOrder) {
+-        return getCostRangeIndex(masks, table.getRowCountApproximation(),
+-                filter, sortOrder);
+-    }
+-
+-    @Override
+-    public void remove(Session session) {
+-        if (!treeMap.isClosed()) {
+-            store.removeMap(treeMap);
+-        }
+-    }
+-
+-    @Override
+-    public void truncate(Session session) {
+-        treeMap.clear();
+-    }
+-
+-    @Override
+-    public void checkRename() {
+-        // nothing to do
+-    }
+-
+-    @Override
+-    public boolean needRebuild() {
+-        return needRebuild;
+-    }
+-
+-    @Override
+-    public boolean canGetFirstOrLast() {
+-        return true;
+-    }
+-
+-    @Override
+-    public Cursor findFirstOrLast(Session session, boolean first) {
+-        if (closed) {
+-            throw DbException.throwInternalError();
+-        }
+-        if (!first) {
+-            throw DbException.throwInternalError(
+-                    "Spatial Index can only be fetch by ascending order");
+-        }
+-        return find(session);
+-    }
+-
+-    @Override
+-    public long getRowCount(Session session) {
+-        return treeMap.sizeAsLong();
+-    }
+-
+-    @Override
+-    public long getRowCountApproximation() {
+-        return treeMap.sizeAsLong();
+-    }
+-
+-    @Override
+-    public long getDiskSpaceUsed() {
+-        // TODO estimate disk space usage
+-        return 0;
+-    }
+-
+-    /**
+-     * A cursor to iterate over spatial keys.
+-     */
+-    private static final class SpatialCursor implements Cursor {
+-
+-        private final Iterator<SpatialKey> it;
+-        private SpatialKey current;
+-        private final Table table;
+-        private Session session;
+-
+-        public SpatialCursor(Iterator<SpatialKey> it, Table table, Session session) {
+-            this.it = it;
+-            this.table = table;
+-            this.session = session;
+-        }
+-
+-        @Override
+-        public Row get() {
+-            return table.getRow(session, current.getId());
+-        }
+-
+-        @Override
+-        public SearchRow getSearchRow() {
+-            return get();
+-        }
+-
+-        @Override
+-        public boolean next() {
+-            if (!it.hasNext()) {
+-                return false;
+-            }
+-            current = it.next();
+-            return true;
+-        }
+-
+-        @Override
+-        public boolean previous() {
+-            return false;
+-        }
+-
+-    }
+-
+-}
+-
+diff --git a/version-1.3.176/h2/src/main/org/h2/mvstore/db/MVSpatialIndex.java b/version-1.3.176/h2/src/main/org/h2/mvstore/db/MVSpatialIndex.java
+deleted file mode 100644
+index d45a1fa..0000000
+--- a/version-1.3.176/h2/src/main/org/h2/mvstore/db/MVSpatialIndex.java
++++ /dev/null
+@@ -1,406 +0,0 @@
+-/*
+- * Copyright 2004-2013 H2 Group. Multiple-Licensed under the H2 License,
+- * Version 1.0, and under the Eclipse Public License, Version 1.0
+- * (http://h2database.com/html/license.html).
+- * Initial Developer: H2 Group
+- */
+-package org.h2.mvstore.db;
+-
+-import java.util.Iterator;
+-import java.util.List;
+-
+-import org.h2.api.ErrorCode;
+-import org.h2.engine.Constants;
+-import org.h2.engine.Database;
+-import org.h2.engine.Session;
+-import org.h2.index.BaseIndex;
+-import org.h2.index.Cursor;
+-import org.h2.index.IndexCondition;
+-import org.h2.index.IndexType;
+-import org.h2.index.SpatialIndex;
+-import org.h2.message.DbException;
+-import org.h2.mvstore.db.TransactionStore.Transaction;
+-import org.h2.mvstore.db.TransactionStore.TransactionMap;
+-import org.h2.mvstore.db.TransactionStore.VersionedValue;
+-import org.h2.mvstore.db.TransactionStore.VersionedValueType;
+-import org.h2.mvstore.rtree.MVRTreeMap;
+-import org.h2.mvstore.rtree.MVRTreeMap.RTreeCursor;
+-import org.h2.mvstore.rtree.SpatialKey;
+-import org.h2.result.Row;
+-import org.h2.result.SearchRow;
+-import org.h2.result.SortOrder;
+-import org.h2.table.Column;
+-import org.h2.table.IndexColumn;
+-import org.h2.table.TableFilter;
+-import org.h2.value.Value;
+-import org.h2.value.ValueGeometry;
+-import org.h2.value.ValueLong;
+-
+-import com.vividsolutions.jts.geom.Envelope;
+-import com.vividsolutions.jts.geom.Geometry;
+-
+-/**
+- * This is an index based on a MVRTreeMap.
+- *
+- * @author Thomas Mueller
+- * @author Noel Grandin
+- * @author Nicolas Fortin, Atelier SIG, IRSTV FR CNRS 24888
+- */
+-public class MVSpatialIndex extends BaseIndex implements SpatialIndex, MVIndex {
+-
+-    /**
+-     * The multi-value table.
+-     */
+-    final MVTable mvTable;
+-
+-    private final String mapName;
+-    private TransactionMap<SpatialKey, Value> dataMap;
+-    private MVRTreeMap<VersionedValue> spatialMap;
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param db the database
+-     * @param table the table instance
+-     * @param id the index id
+-     * @param indexName the index name
+-     * @param columns the indexed columns (only one geometry column allowed)
+-     * @param indexType the index type (only spatial index)
+-     */
+-    public MVSpatialIndex(
+-            Database db, MVTable table, int id, String indexName,
+-            IndexColumn[] columns, IndexType indexType) {
+-        if (columns.length != 1) {
+-            throw DbException.getUnsupportedException(
+-                    "Can only index one column");
+-        }
+-        IndexColumn col = columns[0];
+-        if ((col.sortType & SortOrder.DESCENDING) != 0) {
+-            throw DbException.getUnsupportedException(
+-                    "Cannot index in descending order");
+-        }
+-        if ((col.sortType & SortOrder.NULLS_FIRST) != 0) {
+-            throw DbException.getUnsupportedException(
+-                    "Nulls first is not supported");
+-        }
+-        if ((col.sortType & SortOrder.NULLS_LAST) != 0) {
+-            throw DbException.getUnsupportedException(
+-                    "Nulls last is not supported");
+-        }
+-        if (col.column.getType() != Value.GEOMETRY) {
+-            throw DbException.getUnsupportedException(
+-                    "Spatial index on non-geometry column, "
+-                    + col.column.getCreateSQL());
+-        }
+-        this.mvTable = table;
+-        initBaseIndex(table, id, indexName, columns, indexType);
+-        if (!database.isStarting()) {
+-            checkIndexColumnTypes(columns);
+-        }
+-        mapName = "index." + getId();
+-        ValueDataType vt = new ValueDataType(null, null, null);
+-        VersionedValueType valueType = new VersionedValueType(vt);
+-        MVRTreeMap.Builder<VersionedValue> mapBuilder =
+-                new MVRTreeMap.Builder<VersionedValue>().
+-                valueType(valueType);
+-        spatialMap = db.getMvStore().getStore().openMap(mapName, mapBuilder);
+-        dataMap = mvTable.getTransaction(null).openMap(spatialMap);
+-    }
+-
+-    @Override
+-    public void addRowsToBuffer(List<Row> rows, String bufferName) {
+-        throw DbException.throwInternalError();
+-    }
+-
+-    @Override
+-    public void addBufferedRows(List<String> bufferNames) {
+-        throw DbException.throwInternalError();
+-    }
+-
+-    @Override
+-    public void close(Session session) {
+-        // ok
+-    }
+-
+-    @Override
+-    public void add(Session session, Row row) {
+-        TransactionMap<SpatialKey, Value> map = getMap(session);
+-        SpatialKey key = getKey(row);
+-        if (indexType.isUnique()) {
+-            // this will detect committed entries only
+-            RTreeCursor cursor = spatialMap.findContainedKeys(key);
+-            Iterator<SpatialKey> it = map.wrapIterator(cursor, false);
+-            while (it.hasNext()) {
+-                SpatialKey k = it.next();
+-                if (k.equalsIgnoringId(key)) {
+-                    throw getDuplicateKeyException(key.toString());
+-                }
+-            }
+-        }
+-        try {
+-            map.put(key, ValueLong.get(0));
+-        } catch (IllegalStateException e) {
+-            throw DbException.get(ErrorCode.CONCURRENT_UPDATE_1, table.getName());
+-        }
+-        if (indexType.isUnique()) {
+-            // check if there is another (uncommitted) entry
+-            RTreeCursor cursor = spatialMap.findContainedKeys(key);
+-            Iterator<SpatialKey> it = map.wrapIterator(cursor, true);
+-            while (it.hasNext()) {
+-                SpatialKey k = it.next();
+-                if (k.equalsIgnoringId(key)) {
+-                    if (map.isSameTransaction(k)) {
+-                        continue;
+-                    }
+-                    map.remove(key);
+-                    if (map.get(k) != null) {
+-                        // committed
+-                        throw getDuplicateKeyException(k.toString());
+-                    }
+-                    throw DbException.get(ErrorCode.CONCURRENT_UPDATE_1, table.getName());
+-                }
+-            }
+-        }
+-    }
+-
+-    private SpatialKey getKey(SearchRow r) {
+-        if (r == null) {
+-            return null;
+-        }
+-        Value v = r.getValue(columnIds[0]);
+-        Geometry g = ((ValueGeometry) v.convertTo(Value.GEOMETRY)).getGeometryNoCopy();
+-        Envelope env = g.getEnvelopeInternal();
+-        return new SpatialKey(r.getKey(),
+-                (float) env.getMinX(), (float) env.getMaxX(),
+-                (float) env.getMinY(), (float) env.getMaxY());
+-    }
+-
+-    @Override
+-    public void remove(Session session, Row row) {
+-        SpatialKey key = getKey(row);
+-        TransactionMap<SpatialKey, Value> map = getMap(session);
+-        try {
+-            Value old = map.remove(key);
+-            if (old == null) {
+-                throw DbException.get(ErrorCode.ROW_NOT_FOUND_WHEN_DELETING_1,
+-                        getSQL() + ": " + row.getKey());
+-            }
+-        } catch (IllegalStateException e) {
+-            throw DbException.get(ErrorCode.CONCURRENT_UPDATE_1, table.getName());
+-        }
+-    }
+-
+-    @Override
+-    public Cursor find(TableFilter filter, SearchRow first, SearchRow last) {
+-        return find(filter.getSession());
+-    }
+-
+-    @Override
+-    public Cursor find(Session session, SearchRow first, SearchRow last) {
+-        return find(session);
+-    }
+-
+-    private Cursor find(Session session) {
+-        Iterator<SpatialKey> cursor = spatialMap.keyIterator(null);
+-        TransactionMap<SpatialKey, Value> map = getMap(session);
+-        Iterator<SpatialKey> it = map.wrapIterator(cursor, false);
+-        return new MVStoreCursor(session, it);
+-    }
+-
+-    @Override
+-    public Cursor findByGeometry(TableFilter filter, SearchRow intersection) {
+-        Session session = filter.getSession();
+-        if (intersection == null) {
+-            return find(session);
+-        }
+-        Iterator<SpatialKey> cursor =
+-                spatialMap.findIntersectingKeys(getEnvelope(intersection));
+-        TransactionMap<SpatialKey, Value> map = getMap(session);
+-        Iterator<SpatialKey> it = map.wrapIterator(cursor, false);
+-        return new MVStoreCursor(session, it);
+-    }
+-
+-    private SpatialKey getEnvelope(SearchRow row) {
+-        Value v = row.getValue(columnIds[0]);
+-        Geometry g = ((ValueGeometry) v.convertTo(Value.GEOMETRY)).getGeometryNoCopy();
+-        Envelope env = g.getEnvelopeInternal();
+-        return new SpatialKey(row.getKey(),
+-                (float) env.getMinX(), (float) env.getMaxX(),
+-                (float) env.getMinY(), (float) env.getMaxY());
+-    }
+-
+-
+-    /**
+-     * Get the row with the given index key.
+-     *
+-     * @param key the index key
+-     * @return the row
+-     */
+-    SearchRow getRow(SpatialKey key) {
+-        SearchRow searchRow = mvTable.getTemplateRow();
+-        searchRow.setKey(key.getId());
+-        return searchRow;
+-    }
+-
+-    @Override
+-    public MVTable getTable() {
+-        return mvTable;
+-    }
+-
+-    @Override
+-    public double getCost(Session session, int[] masks, TableFilter filter,
+-            SortOrder sortOrder) {
+-        return getCostRangeIndex(masks, table.getRowCountApproximation(),
+-                filter, sortOrder);
+-    }
+-
+-    @Override
+-    protected long getCostRangeIndex(int[] masks, long rowCount,
+-            TableFilter filter, SortOrder sortOrder) {
+-        rowCount += Constants.COST_ROW_OFFSET;
+-        long cost = rowCount;
+-        if (masks == null) {
+-            return cost;
+-        }
+-        for (Column column : columns) {
+-            int index = column.getColumnId();
+-            int mask = masks[index];
+-            if ((mask & IndexCondition.SPATIAL_INTERSECTS) != 0) {
+-                cost = 3 + rowCount / 4;
+-            }
+-        }
+-        return cost;
+-    }
+-
+-    @Override
+-    public void remove(Session session) {
+-        TransactionMap<SpatialKey, Value> map = getMap(session);
+-        if (!map.isClosed()) {
+-            Transaction t = mvTable.getTransaction(session);
+-            t.removeMap(map);
+-        }
+-    }
+-
+-    @Override
+-    public void truncate(Session session) {
+-        TransactionMap<SpatialKey, Value> map = getMap(session);
+-        map.clear();
+-    }
+-
+-    @Override
+-    public boolean canGetFirstOrLast() {
+-        return true;
+-    }
+-
+-    @Override
+-    public Cursor findFirstOrLast(Session session, boolean first) {
+-        if (!first) {
+-            throw DbException.throwInternalError(
+-                    "Spatial Index can only be fetch in ascending order");
+-        }
+-        return find(session);
+-    }
+-
+-    @Override
+-    public boolean needRebuild() {
+-        try {
+-            return dataMap.sizeAsLongMax() == 0;
+-        } catch (IllegalStateException e) {
+-            throw DbException.get(ErrorCode.OBJECT_CLOSED);
+-        }
+-    }
+-
+-    @Override
+-    public long getRowCount(Session session) {
+-        TransactionMap<SpatialKey, Value> map = getMap(session);
+-        return map.sizeAsLong();
+-    }
+-
+-    @Override
+-    public long getRowCountApproximation() {
+-        try {
+-            return dataMap.sizeAsLongMax();
+-        } catch (IllegalStateException e) {
+-            throw DbException.get(ErrorCode.OBJECT_CLOSED);
+-        }
+-    }
+-
+-    @Override
+-    public long getDiskSpaceUsed() {
+-        // TODO estimate disk space usage
+-        return 0;
+-    }
+-
+-    @Override
+-    public void checkRename() {
+-        // ok
+-    }
+-
+-    /**
+-     * Get the map to store the data.
+-     *
+-     * @param session the session
+-     * @return the map
+-     */
+-    TransactionMap<SpatialKey, Value> getMap(Session session) {
+-        if (session == null) {
+-            return dataMap;
+-        }
+-        Transaction t = mvTable.getTransaction(session);
+-        return dataMap.getInstance(t, Long.MAX_VALUE);
+-    }
+-
+-    /**
+-     * A cursor.
+-     */
+-    class MVStoreCursor implements Cursor {
+-
+-        private final Session session;
+-        private final Iterator<SpatialKey> it;
+-        private SpatialKey current;
+-        private SearchRow searchRow;
+-        private Row row;
+-
+-        public MVStoreCursor(Session session, Iterator<SpatialKey> it) {
+-            this.session = session;
+-            this.it = it;
+-        }
+-
+-        @Override
+-        public Row get() {
+-            if (row == null) {
+-                SearchRow r = getSearchRow();
+-                if (r != null) {
+-                    row = mvTable.getRow(session, r.getKey());
+-                }
+-            }
+-            return row;
+-        }
+-
+-        @Override
+-        public SearchRow getSearchRow() {
+-            if (searchRow == null) {
+-                if (current != null) {
+-                    searchRow = getRow(current);
+-                }
+-            }
+-            return searchRow;
+-        }
+-
+-        @Override
+-        public boolean next() {
+-            current = it.next();
+-            searchRow = null;
+-            row = null;
+-            return current != null;
+-        }
+-
+-        @Override
+-        public boolean previous() {
+-            throw DbException.getUnsupportedException("previous");
+-        }
+-
+-    }
+-
+-}
+-
+diff --git a/version-1.3.176/h2/src/main/org/h2/mvstore/db/MVTable.java b/version-1.3.176/h2/src/main/org/h2/mvstore/db/MVTable.java
+index 13f8015..925bb27 100644
+--- a/version-1.3.176/h2/src/main/org/h2/mvstore/db/MVTable.java
++++ b/version-1.3.176/h2/src/main/org/h2/mvstore/db/MVTable.java
+@@ -402,10 +402,6 @@ public class MVTable extends TableBase {
+             primaryIndex.setMainIndexColumn(mainIndexColumn);
+             index = new MVDelegateIndex(this, indexId,
+                     indexName, primaryIndex, indexType);
+-        } else if (indexType.isSpatial()) {
+-            index = new MVSpatialIndex(session.getDatabase(),
+-                    this, indexId,
+-                    indexName, cols, indexType);
+         } else {
+             index = new MVSecondaryIndex(session.getDatabase(),
+                     this, indexId,
+@@ -452,10 +448,6 @@ public class MVTable extends TableBase {
+     }
+ 
+     private void rebuildIndexBlockMerge(Session session, MVIndex index) {
+-        if (index instanceof MVSpatialIndex) {
+-            // the spatial index doesn't support multi-way merge sort
+-            rebuildIndexBuffered(session, index);
+-        }
+         // Read entries in memory, sort them, write to a new map (in sorted
+         // order); repeat (using a new map for every block of 1 MB) until all
+         // record are read. Merge all maps to the target (using merge sort;
+diff --git a/version-1.3.176/h2/src/main/org/h2/mvstore/db/ValueDataType.java b/version-1.3.176/h2/src/main/org/h2/mvstore/db/ValueDataType.java
+index 29cc3df..81ddf43 100644
+--- a/version-1.3.176/h2/src/main/org/h2/mvstore/db/ValueDataType.java
++++ b/version-1.3.176/h2/src/main/org/h2/mvstore/db/ValueDataType.java
+@@ -34,7 +34,6 @@ import org.h2.value.ValueDate;
+ import org.h2.value.ValueDecimal;
+ import org.h2.value.ValueDouble;
+ import org.h2.value.ValueFloat;
+-import org.h2.value.ValueGeometry;
+ import org.h2.value.ValueInt;
+ import org.h2.value.ValueJavaObject;
+ import org.h2.value.ValueLobDb;
+@@ -558,12 +557,6 @@ public class ValueDataType implements DataType {
+             }
+             return ValueResultSet.get(rs);
+         }
+-        case Value.GEOMETRY: {
+-            int len = readVarInt(buff);
+-            byte[] b = DataUtils.newBytes(len);
+-            buff.get(b, 0, len);
+-            return ValueGeometry.get(b);
+-        }
+         case SPATIAL_KEY_2D:
+             return spatialType.read(buff);
+         default:
+diff --git a/version-1.3.176/h2/src/main/org/h2/store/Data.java b/version-1.3.176/h2/src/main/org/h2/store/Data.java
+index 79fb080..d96855a 100644
+--- a/version-1.3.176/h2/src/main/org/h2/store/Data.java
++++ b/version-1.3.176/h2/src/main/org/h2/store/Data.java
+@@ -39,7 +39,6 @@ import org.h2.value.ValueDate;
+ import org.h2.value.ValueDecimal;
+ import org.h2.value.ValueDouble;
+ import org.h2.value.ValueFloat;
+-import org.h2.value.ValueGeometry;
+ import org.h2.value.ValueInt;
+ import org.h2.value.ValueJavaObject;
+ import org.h2.value.ValueLob;
+@@ -774,12 +773,6 @@ public class Data {
+             read(b, 0, len);
+             return ValueBytes.getNoCopy(b);
+         }
+-        case Value.GEOMETRY: {
+-            int len = readVarInt();
+-            byte[] b = DataUtils.newBytes(len);
+-            read(b, 0, len);
+-            return ValueGeometry.get(b);
+-        }
+         case Value.JAVA_OBJECT: {
+             int len = readVarInt();
+             byte[] b = DataUtils.newBytes(len);
+diff --git a/version-1.3.176/h2/src/main/org/h2/table/RegularTable.java b/version-1.3.176/h2/src/main/org/h2/table/RegularTable.java
+index 6dc9125..679ae15 100644
+--- a/version-1.3.176/h2/src/main/org/h2/table/RegularTable.java
++++ b/version-1.3.176/h2/src/main/org/h2/table/RegularTable.java
+@@ -31,7 +31,6 @@ import org.h2.index.PageBtreeIndex;
+ import org.h2.index.PageDataIndex;
+ import org.h2.index.PageDelegateIndex;
+ import org.h2.index.ScanIndex;
+-import org.h2.index.SpatialTreeIndex;
+ import org.h2.index.TreeIndex;
+ import org.h2.message.DbException;
+ import org.h2.message.Trace;
+@@ -228,9 +227,6 @@ public class RegularTable extends TableBase {
+                 mainIndex.setMainIndexColumn(mainIndexColumn);
+                 index = new PageDelegateIndex(this, indexId, indexName,
+                         indexType, mainIndex, create, session);
+-            } else if (indexType.isSpatial()) {
+-                index = new SpatialTreeIndex(this, indexId, indexName, cols,
+-                        indexType, true, create, session);
+             } else {
+                 index = new PageBtreeIndex(this, indexId, indexName, cols,
+                         indexType, create, session);
+@@ -248,9 +244,6 @@ public class RegularTable extends TableBase {
+                     index = new NonUniqueHashIndex(this, indexId, indexName,
+                             cols, indexType);
+                 }
+-            } else if (indexType.isSpatial()) {
+-                index = new SpatialTreeIndex(this, indexId, indexName, cols,
+-                        indexType, false, true, session);
+             } else {
+                 index = new TreeIndex(this, indexId, indexName, cols, indexType);
+             }
+diff --git a/version-1.3.176/h2/src/main/org/h2/value/DataType.java b/version-1.3.176/h2/src/main/org/h2/value/DataType.java
+index 02f7969..5a5923e 100644
+--- a/version-1.3.176/h2/src/main/org/h2/value/DataType.java
++++ b/version-1.3.176/h2/src/main/org/h2/value/DataType.java
+@@ -655,13 +655,6 @@ public class DataType {
+                 }
+                 return ValueResultSet.get(rs);
+             }
+-            case Value.GEOMETRY: {
+-                Object x = rs.getObject(columnIndex);
+-                if (x == null) {
+-                    return ValueNull.INSTANCE;
+-                }
+-                return ValueGeometry.getFromGeometry(x);
+-            }
+             default:
+                 throw DbException.throwInternalError("type="+type);
+             }
+@@ -1035,8 +1028,6 @@ public class DataType {
+             return ValueArray.get(x.getClass().getComponentType(), v);
+         } else if (x instanceof Character) {
+             return ValueStringFixed.get(((Character) x).toString());
+-        } else if (isGeometry(x)) {
+-            return ValueGeometry.getFromGeometry(x);
+         } else {
+             return ValueJavaObject.getNoCopy(x, null, session.getDataHandler());
+         }
+diff --git a/version-1.3.176/h2/src/main/org/h2/value/Transfer.java b/version-1.3.176/h2/src/main/org/h2/value/Transfer.java
+index 3c21c9e..828fb3d 100644
+--- a/version-1.3.176/h2/src/main/org/h2/value/Transfer.java
++++ b/version-1.3.176/h2/src/main/org/h2/value/Transfer.java
+@@ -694,11 +694,6 @@ public class Transfer {
+             }
+             return ValueResultSet.get(rs);
+         }
+-        case Value.GEOMETRY:
+-            if (version >= Constants.TCP_PROTOCOL_VERSION_14) {
+-                return ValueGeometry.get(readBytes());
+-            }
+-            return ValueGeometry.get(readString());
+         default:
+             throw DbException.get(ErrorCode.CONNECTION_BROKEN_1, "type=" + type);
+         }
+diff --git a/version-1.3.176/h2/src/main/org/h2/value/Value.java b/version-1.3.176/h2/src/main/org/h2/value/Value.java
+index 21c0472..c775511 100644
+--- a/version-1.3.176/h2/src/main/org/h2/value/Value.java
++++ b/version-1.3.176/h2/src/main/org/h2/value/Value.java
+@@ -812,16 +812,6 @@ public abstract class Value {
+                     return ValueUuid.get(getBytesNoCopy());
+                 }
+             }
+-            case GEOMETRY:
+-                switch(getType()) {
+-                case BYTES:
+-                    return ValueGeometry.get(getBytesNoCopy());
+-                case JAVA_OBJECT:
+-                    Object object = Utils.deserialize(getBytesNoCopy(), getDataHandler());
+-                    if (DataType.isGeometry(object)) {
+-                        return ValueGeometry.getFromGeometry(object);
+-                    }
+-                }
+             }
+             // conversion by parsing the string value
+             String s = getString();
+@@ -893,8 +883,6 @@ public abstract class Value {
+             }
+             case UUID:
+                 return ValueUuid.get(s);
+-            case GEOMETRY:
+-                return ValueGeometry.get(s);
+             default:
+                 throw DbException.throwInternalError("type=" + targetType);
+             }
+diff --git a/version-1.3.176/h2/src/main/org/h2/value/ValueGeometry.java b/version-1.3.176/h2/src/main/org/h2/value/ValueGeometry.java
+deleted file mode 100644
+index fc1cbc9..0000000
+--- a/version-1.3.176/h2/src/main/org/h2/value/ValueGeometry.java
++++ /dev/null
+@@ -1,332 +0,0 @@
+-/*
+- * Copyright 2004-2013 H2 Group. Multiple-Licensed under the H2 License,
+- * Version 1.0, and under the Eclipse Public License, Version 1.0
+- * (http://h2database.com/html/license.html).
+- * Initial Developer: H2 Group
+- */
+-package org.h2.value;
+-
+-import java.sql.PreparedStatement;
+-import java.sql.SQLException;
+-import java.util.Arrays;
+-
+-import com.vividsolutions.jts.geom.CoordinateSequence;
+-import com.vividsolutions.jts.geom.CoordinateSequenceFilter;
+-import com.vividsolutions.jts.geom.PrecisionModel;
+-import org.h2.message.DbException;
+-import org.h2.util.StringUtils;
+-import com.vividsolutions.jts.geom.Envelope;
+-import com.vividsolutions.jts.geom.Geometry;
+-import com.vividsolutions.jts.geom.GeometryFactory;
+-import com.vividsolutions.jts.io.ParseException;
+-import com.vividsolutions.jts.io.WKBReader;
+-import com.vividsolutions.jts.io.WKBWriter;
+-import com.vividsolutions.jts.io.WKTReader;
+-import com.vividsolutions.jts.io.WKTWriter;
+-
+-/**
+- * Implementation of the GEOMETRY data type.
+- *
+- * @author Thomas Mueller
+- * @author Noel Grandin
+- * @author Nicolas Fortin, Atelier SIG, IRSTV FR CNRS 24888
+- */
+-public class ValueGeometry extends Value {
+-
+-    /**
+-     * As conversion from/to WKB cost a significant amount of CPU cycles, WKB
+-     * are kept in ValueGeometry instance.
+-     *
+-     * We always calculate the WKB, because not all WKT values can be
+-     * represented in WKB, but since we persist it in WKB format, it has to be
+-     * valid in WKB
+-     */
+-    private final byte[] bytes;
+-
+-    private final int hashCode;
+-
+-    /**
+-     * The value. Converted from WKB only on request as conversion from/to WKB
+-     * cost a significant amount of CPU cycles.
+-     */
+-    private Geometry geometry;
+-
+-    /**
+-     * Create a new geometry objects.
+-     *
+-     * @param bytes the bytes (always known)
+-     * @param geometry the geometry object (may be null)
+-     */
+-    private ValueGeometry(byte[] bytes, Geometry geometry) {
+-        this.bytes = bytes;
+-        this.geometry = geometry;
+-        this.hashCode = Arrays.hashCode(bytes);
+-    }
+-
+-    /**
+-     * Get or create a geometry value for the given geometry.
+-     *
+-     * @param o the geometry object (of type
+-     *            com.vividsolutions.jts.geom.Geometry)
+-     * @return the value
+-     */
+-    public static ValueGeometry getFromGeometry(Object o) {
+-        return get((Geometry) o);
+-    }
+-
+-    private static ValueGeometry get(Geometry g) {
+-        byte[] bytes = convertToWKB(g);
+-        return (ValueGeometry) Value.cache(new ValueGeometry(bytes, g));
+-    }
+-
+-    private static byte[] convertToWKB(Geometry g) {
+-        boolean includeSRID = g.getSRID() != 0;
+-        int dimensionCount = getDimensionCount(g);
+-        WKBWriter writer = new WKBWriter(dimensionCount, includeSRID);
+-        return writer.write(g);
+-    }
+-
+-    private static int getDimensionCount(Geometry geometry) {
+-        ZVisitor finder = new ZVisitor();
+-        geometry.apply(finder);
+-        return finder.isFoundZ() ? 3 : 2;
+-    }
+-
+-    /**
+-     * Get or create a geometry value for the given geometry.
+-     *
+-     * @param s the WKT representation of the geometry
+-     * @return the value
+-     */
+-    public static ValueGeometry get(String s) {
+-        try {
+-            Geometry g = new WKTReader().read(s);
+-            return get(g);
+-        } catch (ParseException ex) {
+-            throw DbException.convert(ex);
+-        }
+-    }
+-
+-    /**
+-     * Get or create a geometry value for the given geometry.
+-     *
+-     * @param s the WKT representation of the geometry
+-     * @param srid the srid of the object
+-     * @return the value
+-     */
+-    public static ValueGeometry get(String s, int srid) {
+-        try {
+-            GeometryFactory geometryFactory = new GeometryFactory(new PrecisionModel(), srid);
+-            Geometry g = new WKTReader(geometryFactory).read(s);
+-            return get(g);
+-        } catch (ParseException ex) {
+-            throw DbException.convert(ex);
+-        }
+-    }
+-
+-    /**
+-     * Get or create a geometry value for the given geometry.
+-     *
+-     * @param bytes the WKB representation of the geometry
+-     * @return the value
+-     */
+-    public static ValueGeometry get(byte[] bytes) {
+-        return (ValueGeometry) Value.cache(new ValueGeometry(bytes, null));
+-    }
+-
+-    /**
+-     * Get a copy of geometry object. Geometry object is mutable. The returned
+-     * object is therefore copied before returning.
+-     *
+-     * @return a copy of the geometry object
+-     */
+-    public Geometry getGeometry() {
+-        return (Geometry) getGeometryNoCopy().clone();
+-    }
+-
+-    public Geometry getGeometryNoCopy() {
+-        if (geometry == null) {
+-            try {
+-                geometry = new WKBReader().read(bytes);
+-            } catch (ParseException ex) {
+-                throw DbException.convert(ex);
+-            }
+-        }
+-        return geometry;
+-    }
+-
+-    /**
+-     * Test if this geometry envelope intersects with the other geometry
+-     * envelope.
+-     *
+-     * @param r the other geometry
+-     * @return true if the two overlap
+-     */
+-    public boolean intersectsBoundingBox(ValueGeometry r) {
+-        // the Geometry object caches the envelope
+-        return getGeometryNoCopy().getEnvelopeInternal().intersects(
+-                r.getGeometryNoCopy().getEnvelopeInternal());
+-    }
+-
+-    /**
+-     * Get the union.
+-     *
+-     * @param r the other geometry
+-     * @return the union of this geometry envelope and another geometry envelope
+-     */
+-    public Value getEnvelopeUnion(ValueGeometry r) {
+-        GeometryFactory gf = new GeometryFactory();
+-        Envelope mergedEnvelope = new Envelope(getGeometryNoCopy().getEnvelopeInternal());
+-        mergedEnvelope.expandToInclude(r.getGeometryNoCopy().getEnvelopeInternal());
+-        return get(gf.toGeometry(mergedEnvelope));
+-    }
+-
+-    /**
+-     * Get the intersection.
+-     *
+-     * @param r the other geometry
+-     * @return the intersection of this geometry envelope and another
+-     */
+-    public ValueGeometry getEnvelopeIntersection(ValueGeometry r) {
+-        Envelope e1 = getGeometryNoCopy().getEnvelopeInternal();
+-        Envelope e2 = r.getGeometryNoCopy().getEnvelopeInternal();
+-        Envelope e3 = e1.intersection(e2);
+-        // try to re-use the object
+-        if (e3 == e1) {
+-            return this;
+-        } else if (e3 == e2) {
+-            return r;
+-        }
+-        GeometryFactory gf = new GeometryFactory();
+-        return get(gf.toGeometry(e3));
+-    }
+-
+-    @Override
+-    public int getType() {
+-        return Value.GEOMETRY;
+-    }
+-
+-    @Override
+-    public String getSQL() {
+-        // WKT does not hold Z or SRID with JTS 1.13. As getSQL is used to
+-        // export database, it should contains all object attributes. Moreover
+-        // using bytes is faster than converting WKB to Geometry then to WKT.
+-        return "X'" + StringUtils.convertBytesToHex(getBytesNoCopy()) + "'::Geometry";
+-    }
+-
+-    @Override
+-    protected int compareSecure(Value v, CompareMode mode) {
+-        Geometry g = ((ValueGeometry) v).getGeometryNoCopy();
+-        return getGeometryNoCopy().compareTo(g);
+-    }
+-
+-    @Override
+-    public String getString() {
+-        return getWKT();
+-    }
+-
+-    @Override
+-    public long getPrecision() {
+-        return 0;
+-    }
+-
+-    @Override
+-    public int hashCode() {
+-        return hashCode;
+-    }
+-
+-    @Override
+-    public Object getObject() {
+-        return getGeometry();
+-    }
+-
+-    @Override
+-    public byte[] getBytes() {
+-        return getWKB();
+-    }
+-
+-    @Override
+-    public byte[] getBytesNoCopy() {
+-        return getWKB();
+-    }
+-
+-    @Override
+-    public void set(PreparedStatement prep, int parameterIndex)
+-            throws SQLException {
+-        prep.setObject(parameterIndex, getGeometryNoCopy());
+-    }
+-
+-    @Override
+-    public int getDisplaySize() {
+-        return getWKT().length();
+-    }
+-
+-    @Override
+-    public int getMemory() {
+-        return getWKB().length * 20 + 24;
+-    }
+-
+-    @Override
+-    public boolean equals(Object other) {
+-        // The JTS library only does half-way support for 3D coordinates, so
+-        // their equals method only checks the first two coordinates.
+-        return other instanceof ValueGeometry &&
+-                Arrays.equals(getWKB(), ((ValueGeometry) other).getWKB());
+-    }
+-
+-    /**
+-     * Get the value in Well-Known-Text format.
+-     *
+-     * @return the well-known-text
+-     */
+-    public String getWKT() {
+-        return new WKTWriter(3).write(getGeometryNoCopy());
+-    }
+-
+-    /**
+-     * Get the value in Well-Known-Binary format.
+-     *
+-     * @return the well-known-binary
+-     */
+-    public byte[] getWKB() {
+-        return bytes;
+-    }
+-
+-    @Override
+-    public Value convertTo(int targetType) {
+-        if (targetType == Value.JAVA_OBJECT) {
+-            return this;
+-        }
+-        return super.convertTo(targetType);
+-    }
+-
+-    /**
+-     * A visitor that checks if there is a Z coordinate.
+-     */
+-    static class ZVisitor implements CoordinateSequenceFilter {
+-        boolean foundZ;
+-
+-        public boolean isFoundZ() {
+-            return foundZ;
+-        }
+-
+-        @Override
+-        public void filter(CoordinateSequence coordinateSequence, int i) {
+-            if (!Double.isNaN(coordinateSequence.getOrdinate(i, 2))) {
+-                foundZ = true;
+-            }
+-        }
+-
+-        @Override
+-        public boolean isDone() {
+-            return foundZ;
+-        }
+-
+-        @Override
+-        public boolean isGeometryChanged() {
+-            return false;
+-        }
+-
+-    }
+-
+-}
+diff --git a/version-1.3.176/h2/src/test/org/h2/test/unit/TestValueMemory.java b/version-1.3.176/h2/src/test/org/h2/test/unit/TestValueMemory.java
+index 81ce39b..dc94af3 100644
+--- a/version-1.3.176/h2/src/test/org/h2/test/unit/TestValueMemory.java
++++ b/version-1.3.176/h2/src/test/org/h2/test/unit/TestValueMemory.java
+@@ -35,7 +35,6 @@ import org.h2.value.ValueDate;
+ import org.h2.value.ValueDecimal;
+ import org.h2.value.ValueDouble;
+ import org.h2.value.ValueFloat;
+-import org.h2.value.ValueGeometry;
+ import org.h2.value.ValueInt;
+ import org.h2.value.ValueJavaObject;
+ import org.h2.value.ValueLong;
+@@ -195,12 +194,6 @@ public class TestValueMemory extends TestBase implements DataHandler {
+             return ValueUuid.get(random.nextLong(), random.nextLong());
+         case Value.STRING_FIXED:
+             return ValueStringFixed.get(randomString(random.nextInt(100)));
+-        case Value.GEOMETRY:
+-            if (DataType.GEOMETRY_CLASS == null) {
+-                return ValueNull.INSTANCE;
+-            }
+-            return ValueGeometry.get("POINT (" + random.nextInt(100) + " " +
+-                    random.nextInt(100) + ")");
+         default:
+             throw new AssertionError("type=" + type);
+         }

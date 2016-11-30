@@ -1,0 +1,123 @@
+From dfb6059a18f1a83005a8c6f56f61b3704323a300 Mon Sep 17 00:00:00 2001
+From: Mat Booth <mat.booth@redhat.com>
+Date: Tue, 19 Jan 2016 19:54:07 +0000
+Subject: [PATCH] Port to Lucene 4
+
+---
+ version-1.3.176/h2/src/main/META-INF/MANIFEST.MF    | 16 ++++++++--------
+ .../h2/src/main/org/h2/fulltext/FullTextLucene.java | 21 ++++++++++-----------
+ 2 files changed, 18 insertions(+), 19 deletions(-)
+
+diff --git a/version-1.3.176/h2/src/main/META-INF/MANIFEST.MF b/version-1.3.176/h2/src/main/META-INF/MANIFEST.MF
+index d542b3a..042fd6e 100644
+--- a/version-1.3.176/h2/src/main/META-INF/MANIFEST.MF
++++ b/version-1.3.176/h2/src/main/META-INF/MANIFEST.MF
+@@ -23,14 +23,14 @@ Import-Package: javax.management,
+  javax.sql,
+  javax.tools;resolution:=optional,
+  javax.transaction.xa;resolution:=optional,
+- org.apache.lucene.analysis;version="[3.0.0,3.1.0)";resolution:=optional,
+- org.apache.lucene.analysis.standard;version="[3.0.0,3.1.0)";resolution:=optional,
+- org.apache.lucene.document;version="[3.0.0,3.1.0)";resolution:=optional,
+- org.apache.lucene.index;version="[3.0.0,3.1.0)";resolution:=optional,
+- org.apache.lucene.queryParser;version="[3.0.0,3.1.0)";resolution:=optional,
+- org.apache.lucene.search;version="[3.0.0,3.1.0)";resolution:=optional,
+- org.apache.lucene.store;version="[3.0.0,3.1.0)";resolution:=optional,
+- org.apache.lucene.util;version="[3.0.0,3.1.0)";resolution:=optional,
++ org.apache.lucene.analysis;version="[5.0.0,6.0.0)";resolution:=optional,
++ org.apache.lucene.analysis.standard;version="[5.0.0,6.0.0)";resolution:=optional,
++ org.apache.lucene.document;version="[5.0.0,6.0.0)";resolution:=optional,
++ org.apache.lucene.index;version="[5.0.0,6.0.0)";resolution:=optional,
++ org.apache.lucene.queryParser;version="[5.0.0,6.0.0)";resolution:=optional,
++ org.apache.lucene.search;version="[5.0.0,6.0.0)";resolution:=optional,
++ org.apache.lucene.store;version="[5.0.0,6.0.0)";resolution:=optional,
++ org.apache.lucene.util;version="[5.0.0,6.0.0)";resolution:=optional,
+  org.h2;version="[${version},1.4.0)",
+  org.h2.api;version="[${version},1.4.0)",
+  org.h2.fulltext;version="[${version},1.4.0)",
+diff --git a/version-1.3.176/h2/src/main/org/h2/fulltext/FullTextLucene.java b/version-1.3.176/h2/src/main/org/h2/fulltext/FullTextLucene.java
+index 738a165..5f4b84b 100644
+--- a/version-1.3.176/h2/src/main/org/h2/fulltext/FullTextLucene.java
++++ b/version-1.3.176/h2/src/main/org/h2/fulltext/FullTextLucene.java
+@@ -20,12 +20,13 @@
+ import org.apache.lucene.document.DateTools;
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.document.Field;
++import org.apache.lucene.index.DirectoryReader;
+ import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.IndexWriterConfig;
+ import org.apache.lucene.index.Term;
+-import org.apache.lucene.queryParser.QueryParser;
++import org.apache.lucene.queryparser.classic.QueryParser;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.search.Query;
+-import org.apache.lucene.search.Searcher;
+ import org.h2.api.Trigger;
+ import org.h2.command.Parser;
+ import org.h2.engine.Session;
+@@ -304,13 +305,14 @@
+             if (access == null) {
+                 try {
+                     Directory indexDir = path.startsWith(IN_MEMORY_PREFIX) ?
+-                            new RAMDirectory() : FSDirectory.open(new File(path));
+-                    boolean recreate = !IndexReader.indexExists(indexDir);
+-                    Analyzer analyzer = new StandardAnalyzer(Version.LUCENE_30);
+-                    IndexWriter writer = new IndexWriter(indexDir, analyzer,
+-                            recreate, IndexWriter.MaxFieldLength.UNLIMITED);
++                            new RAMDirectory() : FSDirectory.open(new File(path).toPath());
++                    Analyzer analyzer = new StandardAnalyzer();
++                    analyzer.setVersion(Version.LUCENE_5_4_1);
++                    IndexWriterConfig conf = new IndexWriterConfig(analyzer);
++                    conf.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
++                    IndexWriter writer = new IndexWriter(indexDir, conf);
+                     //see http://wiki.apache.org/lucene-java/NearRealtimeSearch
+-                    IndexReader reader = writer.getReader();
++                    IndexReader reader = DirectoryReader.open(indexDir);
+                     access = new IndexAccess();
+                     access.writer = writer;
+                     access.reader = reader;
+@@ -395,7 +397,6 @@
+         synchronized (INDEX_ACCESS) {
+             try {
+                 INDEX_ACCESS.remove(indexPath);
+-                access.searcher.close();
+                 access.reader.close();
+                 access.writer.close();
+             } catch (Exception e) {
+@@ -427,11 +428,11 @@
+         try {
+             IndexAccess access = getIndexAccess(conn);
+             // take a reference as the searcher may change
+-            Searcher searcher = access.searcher;
++            IndexSearcher searcher = access.searcher;
+             // reuse the same analyzer; it's thread-safe;
+             // also allows subclasses to control the analyzer used.
+             Analyzer analyzer = access.writer.getAnalyzer();
+-            QueryParser parser = new QueryParser(Version.LUCENE_30,
++            QueryParser parser = new QueryParser(
+                     LUCENE_FIELD_DATA, analyzer);
+             Query query = parser.parse(text);
+             // Lucene 3 insists on a hard limit and will not provide
+@@ -605,9 +606,8 @@
+             try {
+                 indexAccess.writer.commit();
+                 // recreate Searcher with the IndexWriter's reader.
+-                indexAccess.searcher.close();
+                 indexAccess.reader.close();
+-                IndexReader reader = indexAccess.writer.getReader();
++                IndexReader reader = DirectoryReader.open(indexAccess.writer.getDirectory());
+                 indexAccess.reader = reader;
+                 indexAccess.searcher = new IndexSearcher(reader);
+             } catch (IOException e) {
+@@ -716,7 +716,7 @@
+         /**
+          * The index searcher.
+          */
+-        Searcher searcher;
++        IndexSearcher searcher;
+     }
+ 
+ }
+-- 
+2.5.0
+
